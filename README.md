@@ -1,184 +1,147 @@
-# toraniko
+# toraniko on Hyperliquid HIP-3 equity perps
 
-Toraniko is a complete implementation of a risk model suitable for quantitative and systematic trading at institutional scale. In particular, it is a characteristic factor model in the same vein as Barra and Axioma (in fact, given the same datasets, it approximately reproduces Barra's estimated factor returns).
+An end-to-end example of running the [`toraniko`](https://github.com/0xfdf/toraniko) factor
+risk model on the single-name equity perpetuals that **trader.xyz** deploys on Hyperliquid via
+[HIP-3](https://hyperliquid.gitbook.io/hyperliquid-docs/hyperliquid-improvement-proposals-hips/hip-3-builder-deployed-perpetuals).
 
-![mom_factor](https://github.com/user-attachments/assets/f9d2927c-e899-4fd6-944c-8f9a104b410f)
+It estimates a market + sector + style (momentum, size, value) factor model with `toraniko`,
+builds a **market- and sector-neutral mean-variance** book from it, and backtests that book —
+realising PnL only on the HIP-3 perps — against a naive momentum book and S&P 500 buy-and-hold.
+A companion tool prints the **target book to hold today** for manual trading.
 
-Using this library, you can create new custom factors and estimate their returns. Then you can estimate a factor covariance matrix suitable for portfolio optimization with factor exposure constraints (e.g. to main a market neutral portfolio).
+> Educational example, not investment advice or a validated strategy. The HIP-3 history is only
+> a few months long, so every result here is **illustrative, not statistically conclusive** — see
+> [Caveats](#caveats).
 
-The only dependencies are numpy and polars. It supports market, sector and style factors; three styles are included: value, size and momentum. The library also comes with generalizable math and data cleaning utility functions you'd want to have for constructing more style factors (or custom fundamental factors of any kind).
+The example code lives in [`examples/hyperliquid_hip3/`](examples/hyperliquid_hip3/). For the
+underlying `toraniko` factor-model library itself, see [README.toraniko.md](README.toraniko.md).
 
-## Installation
+## Why two data sources
 
-Using pip:
+A perp DEX gives you tradeable prices but no market cap and no fundamentals, and HIP-3 is too
+young to even warm up a momentum signal. So responsibilities are split:
 
-`pip install toraniko`
+| Quantity | Source | Used for |
+| --- | --- | --- |
+| Tradeable returns | Hyperliquid HIP-3 perps | **Realised PnL only**, and only after a name is listed |
+| Returns for signals | Yahoo underlying (adjusted close) | Momentum, factor returns, covariance |
+| Market cap | Yahoo **raw** price × point-in-time shares | Size factor and WLS weighting |
+| Fundamentals | Yahoo quarterly statements, filing-lagged | Value factor (time-varying) |
+| Sectors | Yahoo | Sector factors |
 
-## User Manual
+The listing rule only limits *where PnL is realised* — you trade the perp once it is live. It
+does not limit the data feeding the signal and risk model, so warming those up on the
+underlying's long history is legitimate and introduces no look-ahead (see below).
 
-#### Data
+## Method
 
-You'll need the following data to run a complete model estimation:
+Each trading day *t*, using only information available at *t*:
 
-1. Sector scores, used for estimating the market and sector factor returns. GICS level 1 is suitable for this. The sector scores consist of one row per asset, with 0s in each column except for the sector in which the asset is a member, which is filled with 1.
+1. **Style factors** (`toraniko` functions, unchanged): `factor_mom` (120-day, exp half-life,
+   lagged), `factor_sze` (size / SMB from market cap), `factor_val` (book/sales/cashflow-to-price).
+2. **Factor returns**: `estimate_factor_returns` runs the cross-sectional WLS regression
+   (weights `√cap`, sector sum-to-zero constraint) for market + sectors + styles, with
+   **`residualize_styles=True`** so style returns are orthogonalised to market and sector.
+3. **Risk model**: asset covariance `Σ = B Σ_f Bᵀ + diag(specific var)`, where `B` are the
+   factor exposures, `Σ_f` is the factor-return covariance over a trailing window, and specific
+   risk comes from per-name residuals. Residuals are reconstructed as `winsorize(r) − B·f`
+   (exact for this model).
+4. **Alpha**: equal-weighted composite of the standardised style scores, `z(mom)+z(sze)+z(val)`.
+5. **Portfolio**: market- and sector-neutral mean-variance weights,
+   `w ∝ Σ⁻¹α` projected onto `Cᵀw = 0` (C = market + sector exposures), scaled to a fixed gross
+   book ($1 long / $1 short). This is `backtest.target_weights`, shared by the backtest and the
+   daily report so they never disagree.
 
-```
-symbol	Basic Materials	Communication Services	Consumer Cyclical	Consumer Defensive	Energy	Financial Services	Healthcare	Industrials	Real Estate	Technology	Utilities
-str	i64	i64	i64	i64	i64	i64	i64	i64	i64	i64	i64
-"A"	0	0	0	0	0	0	1	0	0	0	0
-"AA"	1	0	0	0	0	0	0	0	0	0	0
-"AACI"	0	0	0	0	0	1	0	0	0	0	0
-"AACT"	0	0	0	0	0	1	0	0	0	0	0
-"AADI"	0	0	0	0	0	0	1	0	0	0	0
-…	…	…	…	…	…	…	…	…	…	…	…
-"ZVRA"	0	0	0	0	0	0	1	0	0	0	0
-"ZVSA"	0	0	0	0	0	0	1	0	0	0	0
-"ZWS"	0	0	0	0	0	0	0	1	0	0	0
-"ZYME"	0	0	0	0	0	0	1	0	0	0	0
-"ZYXI"	0	0	0	0	0	0	1	0	0	0	0
-```
+## No look-ahead
 
-2. Symbol-by-symbol daily asset returns for a large universe of equities:
+- **Signals** — `factor_mom` lags returns internally; size uses market cap from *raw*
+  (unadjusted) price × point-in-time shares (so split/dividend adjustment can't leak future
+  corporate actions into the cap level); value uses filing-lagged fundamentals (60-day default
+  gap after each fiscal period end). Names without a historical share series are dropped, not
+  back-filled with today's count.
+- **Risk model** — factor covariance and specific risk use only history up to *t*.
+- **Tradability** — a name enters only after its first HIP-3 candle (its listing date), and the
+  book at *t* is restricted to names already priced at *t* (no peeking at *t+1*).
+- **Realisation** — the book formed at the close of *t* earns the perp return *t → t+1*.
 
-```
-date	symbol	asset_returns
-date	str	f64
-2013-01-02	"A"	0.022962
-2013-01-02	"AAMC"	-0.073171
-2013-01-02	"AAME"	0.035566
-2013-01-02	"AAON"	0.019163
-2013-01-02	"AAP"	0.001935
-…	…	…
-2024-02-23	"ZVRA"	-0.025
-2024-02-23	"ZVSA"	0.291311
-2024-02-23	"ZWS"	0.006378
-2024-02-23	"ZYME"	0.000838
-2024-02-23	"ZYXI"	0.001552
-```
+Residual look-ahead it does **not** remove (data-limited): the traded universe is the *current*
+trader.xyz listing (delisted names are missing — survivorship), sector labels are current, and
+the 60-day filing lag is an assumption, not the actual filing date.
 
-3. For the value factor: symbol-by-symbol daily market cap, cash flow, share count, revenue and book value estimates, so you can calculate book-price, sales-price and cash flow-price metrics:
+## Layout
 
-```
-date	symbol	book_price	sales_price	cf_price	market_cap
-date	str	f64	f64	f64	f64
-2013-10-30	"AAPL"	0.343017	0.081994	0.007687	4.5701e11
-2013-10-31	"AAPL"	0.342231	0.081763	0.007665	4.5830e11
-2013-11-01	"AAPL"	0.341398	0.081521	0.007643	4.5966e11
-2013-11-04	"AAPL"	0.340947	0.08137	0.007628	4.6051e11
-2013-11-05	"AAPL"	0.340491	0.081219	0.007614	4.6137e11
-…	…	…	…	…	…
-2024-02-16	"AAPL"	0.072243	0.040937	0.001972	2.9209e12
-2024-02-20	"AAPL"	0.072405	0.040942	0.001972	2.9206e12
-2024-02-21	"AAPL"	0.072614	0.040973	0.001974	2.9184e12
-2024-02-22	"AAPL"	0.072792	0.040987	0.001974	2.9174e12
-2024-02-23	"AAPL"	0.073007	0.041021	0.001976	2.9150e12
-```
+| File | Responsibility |
+| --- | --- |
+| `data.py` | `HyperliquidHIP3` (candles + equity auto-discovery) and `YahooUnderlying` (point-in-time underlying data, per-ticker cache) |
+| `backtest.py` | Build factor inputs, run `estimate_factor_returns`, risk model, `target_weights`, walk-forward backtest |
+| `run.py` | CLI: load → estimate → backtest → stats table + chart (vs naive momentum and SPY) |
+| `report.py` | CLI: today's target book — factor performance, day-over-day changes, full weight list |
 
-#### Style factor score calculation
+## Usage
 
-Taking the foregoing data together you'll have:
+```bash
+pip install -r examples/hyperliquid_hip3/requirements.txt
 
-```
-date	symbol	book_price	sales_price	cf_price	market_cap	asset_returns
-date	str	f64	f64	f64	f64	f64
-2013-02-12	"A"	null	null	null	1.1080e10	0.00045
-2013-02-12	"AAON"	null	null	null	5.5410e8	0.006741
-2013-02-12	"AAP"	null	null	null	5.4212e9	0.002679
-2013-02-12	"AAPL"	0.302543	0.1189	null	4.5847e11	-0.025069
-2013-02-12	"AAT"	null	null	null	1.1135e9	0.006764
-…	…	…	…	…	…	…
-2024-02-23	"ZS"	0.105832	0.016538	0.007052	3.5311e10	0.04015
-2024-02-23	"ZTS"	0.125734	0.025145	-0.017418	8.8010e10	0.002797
-2024-02-23	"ZUO"	0.424385	0.089243	0.073274	1.2309e9	0.002448
-2024-02-23	"ZWS"	0.296327	0.067669	0.001916	5.2727e9	0.006378
-2024-02-23	"ZYME"	0.363093	0.016538	-0.054523	7.3077e8	0.000838
+# Backtest: table + chart vs naive momentum and SPY
+python -m examples.hyperliquid_hip3.run --output /tmp/hip3_backtest.png
+
+# Today's target book for manual trading
+python -m examples.hyperliquid_hip3.report --output /tmp/hip3_today.png
 ```
 
-Then to estimate the momentum factor, you can run
+The report prints a per-name table (side, today vs previous weight as % of GMV, Δ, and an
+action — NEW / INCREASE / DECREASE / FLIP / EXIT) and plots three panels: recent factor
+performance, day-over-day weight changes, and the full target-weight list.
 
-```
-from toraniko.styles import factor_mom
+**Universe** is auto-discovered by default: the live trader.xyz listing minus a non-equity
+blocklist (commodities/FX/indices/ETFs), validated as US equities via Yahoo. New equity
+listings are picked up automatically.
 
-mom_df = factor_mom(df.select("symbol", "date", "asset_returns"), trailing_days=252, winsor_factor=0.01).collect()
-```
+**Caching** (under `.cache/`): the universe scan is cached for `--scan-ttl-days` (default 7);
+Yahoo data is cached **per ticker** and the market caches (Yahoo, HIP-3, SPY) refresh **once per
+calendar day**. So repeated same-day runs are offline, and a newly listed name only fetches that
+one ticker. `--refresh` forces a full re-fetch.
 
-and you'll obtain scores roughly resembling this histogram:
+Useful flags: `--no-auto-discover` (use the curated fallback list), `--tickers …` (pin an
+explicit universe, skips discovery), `--scan-ttl-days`, `--start/--end`, `--warmup-start`,
+`--cost-bps`.
 
-<img width="598" alt="Screenshot 2024-08-05 at 12 28 39 AM" src="https://github.com/user-attachments/assets/88983248-a982-4c9e-9048-c01f1e7d191a">
+Programmatic use:
 
-Likewise for value, you can run: 
+```python
+from examples.hyperliquid_hip3.data import YahooUnderlying, HyperliquidHIP3
+from examples.hyperliquid_hip3.backtest import build_base, estimate_factors, run_backtest, target_weights
 
-```
-from toraniko.styles import factor_val
-
-value_df = factor_val(df.select("date", "symbol", "book_price", "sales_price", "cf_price")).collect()
-```
-
-Similarly:
-
-<img width="624" alt="Screenshot 2024-08-05 at 12 30 08 AM" src="https://github.com/user-attachments/assets/ca5c1afc-128e-4cd6-9871-6d7eb0e77ebc">
-
-#### Factor return estimation
-
-Let's say you've estimated three style factors: value, momentum, size.
-
-```
-date	symbol	mom_score	sze_score	val_score
-date	str	f64	f64	f64
-2014-03-07	"A"	0.793009	-0.872847	0.265801
-2014-03-07	"AAON"	1.128932	0.939116	-1.050307
-2014-03-07	"AAP"	2.190209	0.0	0.351273
-2014-03-07	"AAPL"	-0.202091	-3.373659	-0.289713
-2014-03-07	"AAT"	-0.413211	0.805413	0.052482
-…	…	…	…	…
-2024-02-23	"ZS"	2.783905	-1.303952	-1.778753
-2024-02-23	"ZTS"	0.030749	-1.905171	-1.619675
-2024-02-23	"ZUO"	0.235533	0.905671	0.253427
-2024-02-23	"ZWS"	0.594781	0.0	-0.520947
-2024-02-23	"ZYME"	-1.631452	1.248919	-1.451382
+tickers = HyperliquidHIP3().discover_equities()
+under = YahooUnderlying(cache_dir=".cache").load(tickers, start, end)
+inputs = build_base(under.close, under.market_cap, under.book_price, under.sales_price, under.cf_price, under.sectors)
+model = estimate_factors(inputs)                      # residualize_styles=True
+weights = target_weights(model, inputs.sector_names, date, tradable)  # today's book
 ```
 
-Merge these with the aforementioned GICS sector scores, and take the top N by market cap each day on a suitable universe. Here we'll do the Russell 3000:
+## Example output
 
-```
-from toraniko.utils import top_n_by_group
+*Illustrative snapshot (≈6-month window, 46 names) — not a validated result; see Caveats.*
 
-ddf = (
-    ret_df.join(cap_df.drop("book_value"), on=["date", "symbol"])
-    .join(sector_scores, on="symbol")
-    .join(style_scores, on=["date", "symbol"])
-    .drop_nulls()
-)
-ddf = (
-    top_n_by_group(
-        ddf.lazy(),
-        3000,
-        "market_cap",
-        ("date",),
-        True
-    )
-    .collect()
-    .sort("date", "symbol")
-)
+Backtest — full-model MVO vs. naive momentum vs. S&P 500 buy-and-hold:
 
-returns_df = ddf.select("date", "symbol", "asset_returns")
-mkt_cap_df = ddf.select("date", "symbol", "market_cap")
-sector_df = ddf.select(["date"] + list(sector_scores.columns))
-style_df = ddf.select(style_scores.columns)
-```
+![backtest](examples/hyperliquid_hip3/images/backtest.png)
 
-Then simply:
+Daily target book — factor performance, day-over-day changes, and the weights to hold:
 
-```
-from toraniko.model import estimate_factor_returns
+![today's book](examples/hyperliquid_hip3/images/today.png)
 
-fac_df, eps_df = estimate_factor_returns(returns_df, mkt_cap_df, sector_df, style_df, winsor_factor=0.1, residualize_styles=False)
-```
+## Caveats
 
-On an M1 MacBook, this estimates 10+ years of daily market, sector and style factor returns in under a minute.
-
-Here is a comparison of the model value factor out versus Barra's. Even on a relatively low quality data source (Yahoo Finance) and without significant effort in cleaning corporate actions, the results are comparable over a 10 year period:
-
-![val_factor](https://github.com/user-attachments/assets/28f41989-f802-4c2f-beed-1d2bda24a96d)
-
-![valu](https://github.com/user-attachments/assets/366f49a8-d7e7-46de-bb61-6f656393275a)
+- **History depth.** HIP-3 launched October 2025 with staggered listings, so the tradeable
+  window is only a few months. Factor *premia* are not statistically estimable over it (t-stats
+  below 2), and strategy rankings flip with the window. The pipeline is correct; the *edge* is
+  unverified.
+- **Perp ≠ stock.** Realised PnL uses perp mark prices (funding, basis, 24/7 trading); the
+  signal is computed on the underlying. **Funding costs are not modelled** — only a simple
+  per-turnover trading cost.
+- **Universe** relies on a hand-maintained non-equity blocklist (`data.NON_EQUITY_SYMBOLS`) for
+  category symbols that collide with equity tickers (e.g. GOLD, CL); a curated list
+  (`DEFAULT_TICKERS`) is the offline fallback.
+- **No position limits or volatility targeting** — the book is scaled to a fixed gross only.
+- This is **decision support, not an order router.**
